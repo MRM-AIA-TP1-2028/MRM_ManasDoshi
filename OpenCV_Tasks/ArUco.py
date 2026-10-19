@@ -2,8 +2,8 @@ import cv2
 import numpy as np
 import os
 
-CALIB_FILE = "camera_calibration.yaml"  
-MARKER_SIZE_METERS = 0.034              
+CALIB_FILE = "camera_calibration.yaml"
+MARKER_SIZE_METERS = 0.034
 
 ARUCO_DICT = {
     "DICT_4X4_100": cv2.aruco.DICT_4X4_100,
@@ -12,21 +12,23 @@ ARUCO_DICT = {
 }
 
 def load_camera_calibration(calib_path):
-    if not os.path.exists(calib_path):
-        print(f"Error: Calibration file '{calib_path}' not found.")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    calibration_file = os.path.join(script_dir, calib_path)
+    if not os.path.exists(calibration_file):
+        print(f"Error: Calibration file '{calibration_file}' not found.")
         print("Please calibrate your camera using a chessboard pattern and save the parameters to an OpenCV YAML file.")
         exit(1)
         
-    cv_file = cv2.FileStorage(calib_path, cv2.FILE_STORAGE_READ)
+    cv_file = cv2.FileStorage(calibration_file, cv2.FILE_STORAGE_READ)
     camera_matrix = cv_file.getNode("camera_matrix").mat()
-    dist_coeffs = cv_file.getNode("dist_coeff").mat()
+    dist_coeffs = cv_file.getNode("distortion_coefficients").mat()
     cv_file.release()
     
     return camera_matrix, dist_coeffs
 
 camera_matrix, dist_coeffs = load_camera_calibration(CALIB_FILE)
 
-cap = cv2.VideoCapture(0)  
+cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     print("Error: Could not open webcam.")
     exit()
@@ -74,7 +76,9 @@ while True:
                     depth_m = tvec[2][0]
                     depth_cm = depth_m * 100
 
-                    text = f"ID: {ids[i][0]} | Depth: {depth_cm:.1f} cm"
+                    marker_id = int(np.atleast_1d(ids[i])[0])
+
+                    text = f"ID: {marker_id} | Depth: {depth_cm:.1f} cm"
                     
                     corner_point = tuple(corners[i][0][0].astype(int))
                     cv2.putText(
