@@ -2,269 +2,600 @@ from collections import deque
 import os
 import cv2
 import numpy as np
+import math
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 calibration_file = os.path.join(script_dir, "camera_calibration.yaml")
+
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
+
+MAX_TRACK_DISTANCE = 80
+MAX_DISAPPEARED = 15
+TRAIL_LENGTH = 32
+
+MIN_BLUE_AREA = 400
+
+MIN_BALL_AREA = 120
+MIN_BALL_RADIUS = 10
+MAX_BALL_RADIUS = 250
+MIN_CIRCULARITY = 0.75
+
+lower_blue = np.array([90, 65, 35], dtype=np.uint8)
+upper_blue = np.array([135, 255, 255], dtype=np.uint8)
+
+lower_yellow = np.array([18, 60, 50], dtype=np.uint8)
+upper_yellow = np.array([40, 255, 255], dtype=np.uint8)
+
 if not os.path.exists(calibration_file):
-    print(
-        f"Error: '{calibration_file}' not found! Please run the calibration"
-        " script first."
+    raise FileNotFoundError(
+        f"Calibration file not found: {calibration_file}"
     )
-    exit()
 
-cv_file = cv2.FileStorage(calibration_file, cv2.FILE_STORAGE_READ)
-mtx = cv_file.getNode("camera_matrix").mat()
-dist = cv_file.getNode("distortion_coefficients").mat()
-cv_file.release()
-
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-ret, frame = cap.read()
-if not ret:
-    cap.release()
-    exit()
-
-h, w = frame.shape[:2]
-newcameramtx, roi = cv2.getOptimalNewCameraMatrix(mtx, dist, (w, h), 1, (w, h))
-map1, map2 = cv2.initUndistortRectifyMap(
-    mtx, dist, None, newcameramtx, (w, h), cv2.CV_16SC2
+calibration = cv2.FileStorage(
+    calibration_file,
+    cv2.FILE_STORAGE_READ
 )
 
-lower_blue = np.array([100, 100, 50])
-upper_blue = np.array([130, 255, 255])
+if not calibration.isOpened():
+    raise RuntimeError(
+        "Could not open camera_calibration.yaml"
+    )
 
-lower_tennis = np.array([20, 100, 100])
-upper_tennis = np.array([38, 255, 255])
+camera_matrix = calibration.getNode("camera_matrix").mat()
+dist_coeffs = calibration.getNode(
+    "distortion_coefficients"
+).mat()
+
+calibration.release()
+
+if camera_matrix is None:
+    raise ValueError("camera_matrix is missing from the YAML file.")
+
+if dist_coeffs is None:
+    raise ValueError(
+        "distortion_coefficients is missing from the YAML file."
+    )
+
+camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
+dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
+
+if camera_matrix.shape != (3, 3):
+    raise ValueError("camera_matrix must be a 3x3 matrix.")
+
+if not np.all(np.isfinite(camera_matrix)):
+    raise ValueError("camera_matrix contains invalid values.")
+
+if not np.all(np.isfinite(dist_coeffs)):
+    raise ValueError("distortion_coefficients contains invalid values.")
+
+if camera_matrix[0, 0] <= 0 or camera_matrix[1, 1] <= 0:
+    raise ValueError("Camera focal lengths must be positive.")
+
+cap = cv2.VideoCapture(0)
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+if not cap.isOpened():
+    raise RuntimeError("Could not open webcam.")
+
+ret, first_frame = cap.read()
+
+if not ret:
+    cap.release()
+    raise RuntimeError("Could not read the first webcam frame.")
+
+actual_height, actual_width = first_frame.shape[:2]
+
+scale_x = actual_width / FRAME_WIDTH
+scale_y = actual_height / FRAME_HEIGHT
+
+scaled_camera_matrix = camera_matrix.copy()
+scaled_camera_matrix[0, 0] *= scale_x
+scaled_camera_matrix[0, 1] *= scale_x
+scaled_camera_matrix[0, 2] *= scale_x
+scaled_camera_matrix[1, 0] *= scale_y
+scaled_camera_matrix[1, 1] *= scale_y
+scaled_camera_matrix[1, 2] *= scale_y
+
+new_camera_matrix, roi = cv2.getOptimalNewCameraMatrix(
+    scaled_camera_matrix,
+    dist_coeffs,
+    (actual_width, actual_height),
+    1,
+    (actual_width, actual_height)
+)
+
+map_x, map_y = cv2.initUndistortRectifyMap(
+    scaled_camera_matrix,
+    dist_coeffs,
+    None,
+    new_camera_matrix,
+    (actual_width, actual_height),
+    cv2.CV_32FC1
+)
 
 kernel = np.ones((5, 5), np.uint8)
-PIXEL_TO_CM2 = 0.05
+
+clahe = cv2.createCLAHE(
+    clipLimit=2.0,
+    tileGridSize=(8, 8)
+)
 
 active_blue_objects = {}
-active_tennis_objects = {}
+active_yellow_objects = {}
+
 next_blue_id = 0
-next_tennis_id = 0
-MAX_DISAPPEARED = 15
+next_yellow_id = 0
 
-def get_unique_color(obj_id, is_tennis=False):
-    np.random.seed(obj_id * 37 + (150 if is_tennis else 10))
-    color = np.random.randint(50, 255, size=3).tolist()
-    return (int(color[0]), int(color[1]), int(color[2]))
+def get_unique_color(object_id, object_type):
+    rng = np.random.default_rng(
+        object_id + (1000 if object_type == "yellow" else 0)
+    )
 
-print("=== MULTI-OBJECT UNIQUE COLOR TRACKER ===")
-print("Press 'q' to quit.")
+    return (
+        int(rng.integers(100, 256)),
+        int(rng.integers(100, 256)),
+        int(rng.integers(100, 256))
+    )
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+def get_contour_centroid(contour):
+    moments = cv2.moments(contour)
 
-    undistorted_frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
-    blurred = cv2.GaussianBlur(undistorted_frame, (5, 5), 0)
+    if moments["m00"] == 0:
+        return None
+
+    cx = int(moments["m10"] / moments["m00"])
+    cy = int(moments["m01"] / moments["m00"])
+
+    return cx, cy
+
+def detect_objects(frame):
+    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-    blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN, kernel, iterations=2)
-    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    blue_mask = cv2.inRange(
+        hsv,
+        lower_blue,
+        upper_blue
+    )
 
-    # Stronger morphological closing for tennis ball to fuse internal fragments
-    tennis_mask = cv2.inRange(hsv, lower_tennis, upper_tennis)
-    tennis_mask = cv2.morphologyEx(tennis_mask, cv2.MORPH_OPEN, kernel, iterations=2)
-    tennis_mask = cv2.morphologyEx(tennis_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+    blue_mask = cv2.morphologyEx(
+        blue_mask,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1
+    )
 
-    blue_contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    tennis_contours, _ = cv2.findContours(tennis_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blue_mask = cv2.morphologyEx(
+        blue_mask,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=2
+    )
 
-    black_canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    blue_contours, _ = cv2.findContours(
+        blue_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
 
-    # --- PROCESS BLUE OBJECTS ---
-    current_blue_detections = []
-    for c in blue_contours:
-        area_px = cv2.contourArea(c)
-        if area_px > 400:
-            M = cv2.moments(c)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                current_blue_detections.append({"center": (cx, cy), "area": area_px})
+    blue_detections = []
 
-    updated_blue_objects = {}
-    for det in current_blue_detections:
-        matched_id = None
-        min_dist = float("inf")
-        for obj_id, data in active_blue_objects.items():
-            dist = np.hypot(data["center"][0] - det["center"][0], data["center"][1] - det["center"][1])
-            if dist < min_dist and dist < 80:
-                min_dist = dist
-                matched_id = obj_id
+    for contour in blue_contours:
+        area = cv2.contourArea(contour)
 
-        if matched_id is not None:
-            prev_cx, prev_cy = active_blue_objects[matched_id]["center"]
-            smooth_cx = int(0.6 * prev_cx + 0.4 * det["center"][0])
-            smooth_cy = int(0.6 * prev_cy + 0.4 * det["center"][1])
-            smooth_center = (smooth_cx, smooth_cy)
+        if area < MIN_BLUE_AREA:
+            continue
 
-            q = active_blue_objects[matched_id]["deque"]
-            q.appendleft(smooth_center)
+        centre = get_contour_centroid(contour)
 
-            updated_blue_objects[matched_id] = {
-                "center": smooth_center,
-                "deque": q,
-                "area": det["area"],
-                "disappeared": 0,
-                "color": active_blue_objects[matched_id]["color"]
-            }
-            active_blue_objects.pop(matched_id)
+        if centre is None:
+            continue
+
+        x, y, box_w, box_h = cv2.boundingRect(contour)
+
+        blue_detections.append({
+            "center": centre,
+            "area": float(area),
+            "contour": contour,
+            "bbox": (x, y, box_w, box_h),
+            "radius": None,
+            "circularity": None,
+            "solidity": None
+        })
+
+    yellow_mask = cv2.inRange(
+        hsv,
+        lower_yellow,
+        upper_yellow
+    )
+
+    yellow_mask = cv2.morphologyEx(
+        yellow_mask,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=1
+    )
+
+    yellow_mask = cv2.morphologyEx(
+        yellow_mask,
+        cv2.MORPH_CLOSE,
+        kernel,
+        iterations=1
+    )
+
+    yellow_contours, _ = cv2.findContours(
+        yellow_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    yellow_detections = []
+
+    for contour in yellow_contours:
+        area = cv2.contourArea(contour)
+
+        if area < MIN_BALL_AREA:
+            continue
+
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter == 0:
+            continue
+
+        circularity = (4 * math.pi * area) / (perimeter ** 2)
+
+        if circularity < MIN_CIRCULARITY:
+            continue
+
+        (cx, cy), radius = cv2.minEnclosingCircle(contour)
+        cx, cy, radius = int(cx), int(cy), int(radius)
+
+        if radius < MIN_BALL_RADIUS or radius > MAX_BALL_RADIUS:
+            continue
+
+        hull = cv2.convexHull(contour)
+        hull_area = cv2.contourArea(hull)
+        solidity = float(area) / float(hull_area) if hull_area > 0 else 0.0
+
+        x, y, box_w, box_h = cv2.boundingRect(contour)
+
+        yellow_detections.append({
+            "center": (cx, cy),
+            "area": float(area),
+            "contour": contour,
+            "bbox": (x, y, box_w, box_h),
+            "radius": float(radius),
+            "circularity": float(circularity),
+            "solidity": float(solidity)
+        })
+
+    return blue_detections, yellow_detections
+
+def update_tracks(detections, active_objects, next_id, object_type):
+    for track in active_objects.values():
+        track["matched"] = False
+        track["visible"] = False
+
+    available_tracks = set(active_objects.keys())
+
+    for detection in detections:
+        centre = detection["center"]
+
+        best_id = None
+        best_distance = float("inf")
+
+        for track_id in available_tracks:
+            old_centre = active_objects[track_id]["center"]
+            distance = math.dist(centre, old_centre)
+
+            if (
+                distance < MAX_TRACK_DISTANCE
+                and distance < best_distance
+            ):
+                best_distance = distance
+                best_id = track_id
+
+        if best_id is not None:
+            track = active_objects[best_id]
+
+            old_x, old_y = track["center"]
+            new_x, new_y = centre
+
+            track["center"] = (
+                int(0.6 * old_x + 0.4 * new_x),
+                int(0.6 * old_y + 0.4 * new_y)
+            )
+
+            track["area"] = detection["area"]
+            track["contour"] = detection["contour"]
+            track["bbox"] = detection["bbox"]
+            track["radius"] = detection["radius"]
+            track["circularity"] = detection["circularity"]
+            track["solidity"] = detection["solidity"]
+            track["disappeared"] = 0
+            track["visible"] = True
+            track["matched"] = True
+            track["trail"].appendleft(track["center"])
+
+            available_tracks.remove(best_id)
+
         else:
-            q = deque(maxlen=32)
-            q.appendleft(det["center"])
-            assigned_color = get_unique_color(next_blue_id, is_tennis=False)
-            updated_blue_objects[next_blue_id] = {
-                "center": det["center"],
-                "deque": q,
-                "area": det["area"],
+            track_id = next_id
+            next_id += 1
+
+            active_objects[track_id] = {
+                "center": centre,
+                "area": detection["area"],
+                "contour": detection["contour"],
+                "bbox": detection["bbox"],
+                "radius": detection["radius"],
+                "circularity": detection["circularity"],
+                "solidity": detection["solidity"],
+                "color": get_unique_color(track_id, object_type),
+                "trail": deque([centre], maxlen=TRAIL_LENGTH),
                 "disappeared": 0,
-                "color": assigned_color
+                "visible": True,
+                "matched": True
             }
-            next_blue_id += 1
 
-    for obj_id, data in active_blue_objects.items():
-        data["disappeared"] += 1
-        if data["disappeared"] <= MAX_DISAPPEARED:
-            updated_blue_objects[obj_id] = data
-    active_blue_objects = updated_blue_objects
+    for track_id in list(active_objects.keys()):
+        track = active_objects[track_id]
 
-    # --- PROCESS TENNIS BALLS WITH NON-MAXIMUM SUPPRESSION (NMS) ---
-    raw_tennis_detections = []
-    for c in tennis_contours:
-        ((x_t, y_t), radius) = cv2.minEnclosingCircle(c)
-        if radius > 12:  # Raised minimum size filter to ignore speckles
-            raw_tennis_detections.append({"center": (int(x_t), int(y_t)), "radius": int(radius)})
+        if not track["matched"]:
+            track["disappeared"] += 1
 
-    # Sort detections by radius descending so largest/most complete circles take priority
-    raw_tennis_detections = sorted(raw_tennis_detections, key=lambda x: x["radius"], reverse=True)
-    
-    current_tennis_detections = []
-    for det in raw_tennis_detections:
-        # Check if this detection is too close to an already accepted detection (merging duplicates)
-        is_duplicate = False
-        for accepted in current_tennis_detections:
-            dist = np.hypot(accepted["center"][0] - det["center"][0], accepted["center"][1] - det["center"][1])
-            if dist < (accepted["radius"] + det["radius"]) * 0.8:
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            current_tennis_detections.append(det)
+            if track["disappeared"] > MAX_DISAPPEARED:
+                del active_objects[track_id]
 
-    updated_tennis_objects = {}
-    for det in current_tennis_detections:
-        matched_id = None
-        min_dist = float("inf")
-        for obj_id, data in active_tennis_objects.items():
-            dist = np.hypot(data["center"][0] - det["center"][0], data["center"][1] - det["center"][1])
-            if dist < min_dist and dist < 80:
-                min_dist = dist
-                matched_id = obj_id
+    return active_objects, next_id
 
-        if matched_id is not None:
-            prev_cx, prev_cy = active_tennis_objects[matched_id]["center"]
-            smooth_cx = int(0.6 * prev_cx + 0.4 * det["center"][0])
-            smooth_cy = int(0.6 * prev_cy + 0.4 * det["center"][1])
-            smooth_center = (smooth_cx, smooth_cy)
+def draw_tracks(frame, black_canvas, active_objects, object_type):
+    visible_centres = []
 
-            q = active_tennis_objects[matched_id]["deque"]
-            q.appendleft(smooth_center)
+    for track_id, track in active_objects.items():
+        centre = track["center"]
+        colour = track["color"]
+        points = list(track["trail"])
 
-            updated_tennis_objects[matched_id] = {
-                "center": smooth_center,
-                "deque": q,
-                "radius": det["radius"],
-                "disappeared": 0,
-                "color": active_tennis_objects[matched_id]["color"]
-            }
-            active_tennis_objects.pop(matched_id)
+        for i in range(1, len(points)):
+            thickness = max(
+                1,
+                int(3 * (1.0 - i / len(points)))
+            )
+
+            cv2.line(
+                black_canvas,
+                points[i - 1],
+                points[i],
+                colour,
+                thickness
+            )
+
+        if not track["visible"]:
+            continue
+
+        visible_centres.append(centre)
+
+        area_px = track["area"]
+
+        if object_type == "blue":
+            cv2.drawContours(
+                frame,
+                [track["contour"]],
+                -1,
+                (255, 0, 0),
+                2
+            )
+
+            cv2.circle(
+                frame,
+                centre,
+                5,
+                (0, 0, 255),
+                -1
+            )
+
+            label = f"Blue ID {track_id}"
+
         else:
-            q = deque(maxlen=32)
-            q.appendleft(det["center"])
-            assigned_color = get_unique_color(next_tennis_id, is_tennis=True)
-            updated_tennis_objects[next_tennis_id] = {
-                "center": det["center"],
-                "deque": q,
-                "radius": det["radius"],
-                "disappeared": 0,
-                "color": assigned_color
-            }
-            next_tennis_id += 1
+            cv2.circle(
+                frame,
+                centre,
+                int(track["radius"]),
+                (0, 255, 255),
+                2
+            )
 
-    for obj_id, data in active_tennis_objects.items():
-        data["disappeared"] += 1
-        if data["disappeared"] <= MAX_DISAPPEARED:
-            updated_tennis_objects[obj_id] = data
-    active_tennis_objects = updated_tennis_objects
+            cv2.circle(
+                frame,
+                centre,
+                4,
+                (0, 0, 255),
+                -1
+            )
 
-    # --- DRAWING & METRICS ---
-    primary_blue_center = None
-    primary_tennis_center = None
+            label = f"Yellow Ball ID {track_id}"
 
-    for obj_id, data in active_blue_objects.items():
-        if data["disappeared"] == 0:
-            center = data["center"]
-            area_px = data["area"]
-            area_cm2 = area_px * PIXEL_TO_CM2
-            obj_color = data["color"]
+        cv2.putText(
+            frame,
+            label,
+            (centre[0] + 8, centre[1] - 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            colour,
+            2
+        )
 
-            if primary_blue_center is None:
-                primary_blue_center = center
+        cv2.putText(
+            frame,
+            f"Area: {area_px:.0f} px",
+            (centre[0] + 8, centre[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1
+        )
 
-            cv2.circle(undistorted_frame, center, 5, obj_color, -1)
-            text = f"Blue #{obj_id}: {int(area_px)}px^2 ({area_cm2:.1f}cm^2)"
-            cv2.putText(undistorted_frame, text, (center[0] - 30, center[1] - 15),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, obj_color, 2)
+        cv2.circle(
+            black_canvas,
+            centre,
+            5,
+            colour,
+            -1
+        )
 
-        pts = data["deque"]
-        obj_color = data["color"]
-        for i in range(1, len(pts)):
-            if pts[i - 1] is not None and pts[i] is not None:
-                cv2.line(black_canvas, pts[i - 1], pts[i], obj_color, 2)
+        cv2.putText(
+            black_canvas,
+            f"{object_type.capitalize()} {track_id}",
+            (centre[0] + 8, centre[1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            colour,
+            2
+        )
 
-    for obj_id, data in active_tennis_objects.items():
-        if data["disappeared"] == 0:
-            center = data["center"]
-            radius = data["radius"]
-            area_px = np.pi * (radius ** 2)
-            area_cm2 = area_px * PIXEL_TO_CM2
-            obj_color = data["color"]
+    return visible_centres
 
-            if primary_tennis_center is None:
-                primary_tennis_center = center
+try:
+    while True:
+        ret, frame = cap.read()
 
-            cv2.circle(undistorted_frame, center, radius, obj_color, 2)
-            cv2.circle(undistorted_frame, center, 5, obj_color, -1)
+        if not ret:
+            print("Could not read webcam frame.")
+            break
 
-            metrics_text = f"Ball #{obj_id} | C:{center} | R:{radius}px | Area:{int(area_px)}px^2 ({area_cm2:.1f}cm^2)"
-            cv2.putText(undistorted_frame, metrics_text, (20, 30 + (obj_id * 25)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, obj_color, 2)
+        undistorted_frame = cv2.remap(
+            frame,
+            map_x,
+            map_y,
+            cv2.INTER_LINEAR
+        )
 
-        pts = data["deque"]
-        obj_color = data["color"]
-        for i in range(1, len(pts)):
-            if pts[i - 1] is not None and pts[i] is not None:
-                cv2.line(black_canvas, pts[i - 1], pts[i], obj_color, 2)
+        height, width = undistorted_frame.shape[:2]
 
-    if primary_blue_center and primary_tennis_center:
-        cv2.line(undistorted_frame, primary_blue_center, primary_tennis_center, (0, 255, 0), 2)
-        dx = primary_tennis_center[0] - primary_blue_center[0]
-        dy = primary_tennis_center[1] - primary_blue_center[1]
-        rel_text = f"Rel Pos -> dX: {dx}px, dY: {dy}px"
-        cv2.putText(undistorted_frame, rel_text, (20, h - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        black_canvas = np.zeros(
+            (height, width, 3),
+            dtype=np.uint8
+        )
 
-    cv2.imshow("Blue Object & Tennis Ball Tracker", undistorted_frame)
-    cv2.imshow("Centroid Tracking (Pitch Black)", black_canvas)
+        (
+            blue_detections,
+            yellow_detections
+        ) = detect_objects(undistorted_frame)
 
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+        active_blue_objects, next_blue_id = update_tracks(
+            blue_detections,
+            active_blue_objects,
+            next_blue_id,
+            "blue"
+        )
 
-cap.release()
-cv2.destroyAllWindows()
+        active_yellow_objects, next_yellow_id = update_tracks(
+            yellow_detections,
+            active_yellow_objects,
+            next_yellow_id,
+            "yellow"
+        )
+
+        draw_tracks(
+            undistorted_frame,
+            black_canvas,
+            active_blue_objects,
+            "blue"
+        )
+
+        draw_tracks(
+            undistorted_frame,
+            black_canvas,
+            active_yellow_objects,
+            "yellow"
+        )
+
+        visible_blue_ids = sorted(
+            track_id
+            for track_id, track in active_blue_objects.items()
+            if track["visible"]
+        )
+
+        visible_yellow_ids = sorted(
+            track_id
+            for track_id, track in active_yellow_objects.items()
+            if track["visible"]
+        )
+
+        if visible_blue_ids and visible_yellow_ids:
+            primary_blue = active_blue_objects[visible_blue_ids[0]]
+            primary_yellow = active_yellow_objects[visible_yellow_ids[0]]
+
+            blue_centre = primary_blue["center"]
+            yellow_centre = primary_yellow["center"]
+
+            dx = yellow_centre[0] - blue_centre[0]
+            dy = yellow_centre[1] - blue_centre[1]
+
+            cv2.line(
+                undistorted_frame,
+                blue_centre,
+                yellow_centre,
+                (255, 255, 255),
+                2
+            )
+
+            midpoint = (
+                (blue_centre[0] + yellow_centre[0]) // 2,
+                (blue_centre[1] + yellow_centre[1]) // 2
+            )
+
+            cv2.putText(
+                undistorted_frame,
+                f"dx: {dx}px, dy: {dy}px",
+                midpoint,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2
+            )
+
+        blue_visible_count = len(visible_blue_ids)
+        yellow_visible_count = len(visible_yellow_ids)
+
+        cv2.putText(
+            undistorted_frame,
+            f"Blue objects: {blue_visible_count}",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 100, 0),
+            2
+        )
+
+        cv2.putText(
+            undistorted_frame,
+            f"Yellow balls: {yellow_visible_count}",
+            (10, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 255),
+            2
+        )
+
+        cv2.imshow(
+            "Blue Object & Yellow Ball Tracker",
+            undistorted_frame
+        )
+
+        cv2.imshow(
+            "Centroid Tracking (Pitch Black)",
+            black_canvas
+        )
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+            break
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
